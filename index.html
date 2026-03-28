@@ -66,6 +66,7 @@ h1 { font-family: 'Bebas Neue', sans-serif; font-size: clamp(1.8rem,7vw,2.8rem);
   cursor: pointer; white-space: nowrap; transition: all 0.2s;
 }
 .new-day-btn:hover { border-color: var(--accent2); color: var(--accent2); }
+.new-day-btn.active { background: var(--accent); border-color: var(--accent); color: #0a0a0f; }
 .day-tabs { display: flex; gap: 8px; overflow-x: auto; scrollbar-width: none; }
 .day-tabs::-webkit-scrollbar { display: none; }
 .tab {
@@ -228,7 +229,7 @@ h1 { font-family: 'Bebas Neue', sans-serif; font-size: clamp(1.8rem,7vw,2.8rem);
       <h1>RUTINA</h1>
       <div class="header-right">
         <span class="sync-label"><span class="sync-dot" id="syncDot"></span><span id="syncText">—</span></span>
-        <button class="new-day-btn" onclick="showModal()">🌅 Nuevo día</button>
+        <button class="new-day-btn" onclick="showModal()">✅ Dia terminado</button>
       </div>
     </div>
     <div class="day-tabs" id="dayTabs"></div>
@@ -240,16 +241,18 @@ h1 { font-family: 'Bebas Neue', sans-serif; font-size: clamp(1.8rem,7vw,2.8rem);
 <div class="screen" id="screen-cardio" style="padding-bottom:40px;">
   <div class="prog-content">
     <div class="prog-title">CARDIO</div>
-    <div class="prog-sub">Caminar · Correr · Datos de Strava</div>
+    <div class="prog-sub">Caminar · Correr · Entrada manual</div>
 
-    <div class="section-label">🔄 Sincronización</div>
+      <div class="section-label">✍️ Entrada manual</div>
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;">
-      <button class="new-day-btn" style="padding:6px 12px;" onclick="syncActivityFromDB()">Sync DB</button>
-      <button class="new-day-btn" style="padding:6px 12px;" onclick="syncActivityFromStrava()">Sync Strava</button>
-      <input id="stravaTokenInput" type="password" placeholder="Access token Strava" style="width:240px;padding:6px;border-radius:8px;background:var(--surface2);border:1px solid var(--border);color:var(--text);">
-      <input id="activityCsvInput" type="file" accept=".csv" style="color:#f0f0f8;" onchange="handleActivityCsv(event)">
-      <span style="color:var(--muted);font-size:0.78rem;flex-basis:100%;">CSV: date,duration_min,distance_km,calories,type</span>
+      <button class="new-day-btn" id="btnRun" style="padding:6px 10px;height:38px;" onclick="setActivityType('run')">🏃 Correr</button>
+      <button class="new-day-btn" id="btnWalk" style="padding:6px 10px;height:38px;" onclick="setActivityType('walk')">🚶 Caminar</button>
+      <input id="manualDistance" type="number" min="0" step="0.1" placeholder="Km" style="width:80px;padding:6px;border-radius:8px;background:var(--surface2);border:1px solid var(--border);color:var(--text);">
+      <input id="manualDuration" type="number" min="0" step="1" placeholder="Min" style="width:80px;padding:6px;border-radius:8px;background:var(--surface2);border:1px solid var(--border);color:var(--text);">
+      <input id="manualCalories" type="number" min="0" step="1" placeholder="Cal" style="width:80px;padding:6px;border-radius:8px;background:var(--surface2);border:1px solid var(--border);color:var(--text);">
+      <button class="new-day-btn" style="padding:6px 12px;" onclick="addManualActivity()">Guardar</button>
     </div>
+    <div id="manualError" style="color:#ff6b47;font-size:0.82rem;margin-bottom:10px;display:none;"></div>
 
     <div class="section-label">📊 Estadísticas</div>
     <div class="chart-card" style="margin-bottom:18px;">
@@ -281,8 +284,8 @@ h1 { font-family: 'Bebas Neue', sans-serif; font-size: clamp(1.8rem,7vw,2.8rem);
 <!-- MODAL -->
 <div class="modal-overlay" id="modal">
   <div class="modal">
-    <div class="modal-icon">🌅</div>
-    <div class="modal-title">Nuevo Día</div>
+    <div class="modal-icon">✅</div>
+    <div class="modal-title">Dia terminado</div>
     <div class="modal-text">Se guarda la sesión actual al historial y se desmarcan todas las series. Los pesos se mantienen.</div>
     <div class="modal-actions">
       <button class="modal-btn modal-btn-cancel" onclick="hideModal()">Cancelar</button>
@@ -417,10 +420,11 @@ async function loadFromDB() {
     if (errHist) throw errHist;
     if (hist) history = hist.map(h => ({ id: h.id, date: h.date, exercises: h.exercises }));
 
-    // Load cardio activity
-    const { data: act, error: errAct } = await supabaseClient.from('fitness_activity').select('id,date,duration_min,distance_km,calories,type').order('date', { ascending: true });
+    // Load running_data (cardio manual)
+    const { data: act, error: errAct } = await supabaseClient.from('running_data').select('id,date,duration_min,distance_km,calories,type').order('date', { ascending: true });
     if (errAct) {
       if (errAct.code !== 'PGRST116' && errAct.code !== '42P01') throw errAct; // tabla puede no existir
+      activities = [];
     } else if (act) {
       activities = act.map(a => ({
         id: a.id,
@@ -431,6 +435,7 @@ async function loadFromDB() {
         type: a.type || 'correr'
       }));
     }
+
 
     setSyncState('synced');
     return true;
@@ -508,109 +513,98 @@ async function saveActivityToDB(activity) {
   }
 }
 
-async function syncActivityFromDB() {
-  await loadFromDB();
-  renderActivity();
+async function saveRunningData(activity) {
+  if (!supabaseClient) {
+    console.warn('Supabase no está disponible para running_data');
+    return;
+  }
+  try {
+    const { data, error } = await supabaseClient.from('running_data').insert({
+      date: activity.date,
+      duration_min: activity.duration_min,
+      distance_km: activity.distance_km,
+      calories: activity.calories,
+      type: activity.type
+    }).select().single();
+    if (error) {
+      console.error('saveRunningData error:', error);
+      return;
+    }
+    console.log('running_data guardado', data);
+  } catch (e) {
+    console.error('saveRunningData exception:', e);
+  }
 }
 
 function renderActivity() {
   const listEl = document.getElementById('activityList');
   if (!activities.length) {
-    document.getElementById('activitySummary').textContent = 'Sin actividades aún. Importá o sincronizá con Strava.';
-    listEl.innerHTML = '<div class="empty-state"><div class="empty-icon">🏃</div><div class="empty-title">Sin datos</div><div class="empty-text">Usá el CSV o sincronizá con Strava.</div></div>';
+    document.getElementById('activitySummary').textContent = 'Sin actividades aún. Importá CSV o agrega manualmente.';
+    listEl.innerHTML = '<div class="empty-state"><div class="empty-icon">🏃</div><div class="empty-title">Sin datos</div><div class="empty-text">Usá el CSV o la entrada manual.</div></div>';
     return;
   }
 
   const totalDist = activities.reduce((acc, a) => acc + Number(a.distance_km || 0), 0);
   const totalTime = activities.reduce((acc, a) => acc + Number(a.duration_min || 0), 0);
   const totalCal = activities.reduce((acc, a) => acc + Number(a.calories || 0), 0);
-  document.getElementById('activitySummary').textContent = `Total: ${totalDist.toFixed(2)}km · ${totalTime.toFixed(0)}min · ${totalCal.toFixed(0)} kcal`;
+  const runs = activities.filter(a => a.type === 'run').length;
+  const walks = activities.filter(a => a.type === 'walk').length;
+
+  document.getElementById('activitySummary').textContent = `Total: ${totalDist.toFixed(2)}km · ${totalTime.toFixed(0)}min · ${totalCal.toFixed(0)} kcal · Corridas ${runs} · Caminatas ${walks}`;
 
   listEl.innerHTML = activities.slice().reverse().map(a => {
     const date = new Date(a.date).toLocaleDateString('es-AR');
-    return `<div class="hist-item"><div class="hist-date">📅 ${date} · ${a.type || 'Correr'}</div><div class="hist-row"><span class="hist-exname">${(a.distance_km || 0).toFixed(2)} km</span><span class="hist-vals">${a.duration_min} min · ${a.calories} kcal</span></div></div>`;
+    return `<div class="hist-item"><div class="hist-date">📅 ${date} · ${(a.type||'correr').toUpperCase()}</div><div class="hist-row"><span class="hist-exname">${(a.distance_km || 0).toFixed(2)} km</span><span class="hist-vals">${a.duration_min} min · ${a.calories} kcal</span></div></div>`;
   }).join('');
 }
 
-function handleActivityCsv(evt) {
-  const file = evt.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = async e => {
-    const text = e.target.result;
-    const lines = text.trim().split('\n');
-    for (let i = 0; i < lines.length; i++) {
-      const row = lines[i].trim();
-      if (!row) continue;
-      const cols = row.split(',').map(c => c.trim());
-      if (cols.length < 4) continue;
-      const [date, duration_min, distance_km, calories, type] = cols;
-      const activity = {
-        date: new Date(date).toISOString(),
-        duration_min: Number(duration_min) || 0,
-        distance_km: Number(distance_km) || 0,
-        calories: Number(calories) || 0,
-        type: type || 'correr'
-      };
-      await saveActivityToDB(activity);
-    }
-    renderActivity();
-  };
-  reader.readAsText(file);
+function setActivityType(type) {
+  document.getElementById('btnRun').classList.toggle('active', type === 'run');
+  document.getElementById('btnWalk').classList.toggle('active', type === 'walk');
+  document.getElementById('activityType').value = type;
 }
 
-async function syncActivityFromStrava() {
-  const tokenInput = document.getElementById('stravaTokenInput');
-  const token = tokenInput && tokenInput.value.trim();
-  if (!token) {
-    alert('Ingresá tu access token de Strava en el campo y probá nuevamente.');
+async function addManualActivity() {
+  const distance = Number(document.getElementById('manualDistance').value || 0);
+  const duration = Number(document.getElementById('manualDuration').value || 0);
+  const calories = Number(document.getElementById('manualCalories').value || 0);
+  const type = (document.getElementById('activityType') && document.getElementById('activityType').value) || 'run';
+
+  const errorEl = document.getElementById('manualError');
+  if (distance <= 0 || duration <= 0) {
+    errorEl.textContent = 'Completá distancia y duración válidas.';
+    errorEl.style.display = 'block';
     return;
   }
+  errorEl.style.display = 'none';
 
-  setSyncState('syncing');
-  try {
-    const url = 'https://www.strava.com/api/v3/athlete/activities?per_page=50&page=1';
-    const res = await fetch(url, {
-      headers: { Authorization: 'Bearer ' + token }
-    });
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error('Strava fetch error ' + res.status + ': ' + errText);
-    }
-    const data = await res.json();
-    if (!Array.isArray(data) || data.length === 0) {
-      alert('No se encontraron actividades en Strava o token inválido.');
-      setSyncState('error');
-      return;
-    }
+  const activity = {
+    date: new Date().toISOString(),
+    distance_km: distance,
+    duration_min: duration,
+    calories: calories || Math.round(distance * 60),
+    type: type
+  };
 
-    let loaded = 0;
-    for (const item of data) {
-      if (!item.start_date_local) continue;
-      const activity = {
-        date: item.start_date_local,
-        duration_min: Math.round((item.moving_time || 0) / 60),
-        distance_km: Number(((item.distance || 0) / 1000).toFixed(2)),
-        calories: item.calories || 0,
-        type: (item.type || 'Correr').toLowerCase()
-      };
-      await saveActivityToDB(activity);
-      loaded += 1;
-    }
-    if (loaded === 0) {
-      alert('No cargó actividades válidas desde Strava.');
-      setSyncState('error');
-    } else {
-      alert('Sincronizadas ' + loaded + ' actividades desde Strava.');
-      setSyncState('synced');
-    }
-    renderActivity();
-  } catch (e) {
-    console.error('syncActivityFromStrava error', e);
-    setSyncState('error');
-    alert('Error al sincronizar Strava: ' + e.message);
-  }
+  activities.push(activity);
+  renderActivity();
+  await saveRunningData(activity);
+
+  document.getElementById('manualDistance').value = '';
+  document.getElementById('manualDuration').value = '';
+  document.getElementById('manualCalories').value = '';
 }
+
+// Hidden field for activity type, default run
+if (!document.getElementById('activityType')) {
+  const hiddenType = document.createElement('input');
+  hiddenType.type = 'hidden';
+  hiddenType.id = 'activityType';
+  hiddenType.value = 'run';
+  document.body.appendChild(hiddenType);
+  setActivityType('run');
+}
+
 
 // Debounced save - snapshot captured at call time to avoid stale closure
 function scheduleSave() {
@@ -1010,6 +1004,9 @@ async function init() {
 
   buildUI();
   DAYS.forEach(day => updateProgress(day.id));
+
+  // Cargar actividad cardio del init
+  renderActivity();
 
   // Cargar gráficos desde el historial actual
   renderProgreso();
